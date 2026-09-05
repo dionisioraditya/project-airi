@@ -2,6 +2,7 @@ import os
 import subprocess
 import asyncio
 import re
+import json
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -14,10 +15,71 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 TEMP_DIR = "/tmp/airi_attachments"
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+MAX_HISTORY_TURNS = 12  # Jumlah pesan terakhir yang disimpan sebagai ingatan
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ==================== SISTEM MEMORI (CHAT HISTORY) ====================
+
+def load_history() -> list:
+    """Membaca riwayat chat dari file JSON lokal"""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_history(history: list):
+    """Menyimpan riwayat chat ke file JSON lokal"""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+def add_to_history(role: str, content: str):
+    """Menambahkan pesan baru ke memori dan membatasi ukuran riwayat"""
+    history = load_history()
+    # Batasi panjang teks pesan yang disimpan agar file tidak terlalu besar
+    clean_content = content.strip()
+    if len(clean_content) > 1500:
+        clean_content = clean_content[:1500] + "... (dipotong)"
+    
+    history.append({"role": role, "content": clean_content})
+    
+    # Ambil hanya N percakapan terakhir
+    if len(history) > MAX_HISTORY_TURNS:
+        history = history[-MAX_HISTORY_TURNS:]
+    
+    save_history(history)
+
+def clear_history():
+    """Mereset seluruh ingatan percakapan"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            os.remove(HISTORY_FILE)
+        except Exception:
+            pass
+
+def format_history_for_prompt() -> str:
+    """Format riwayat chat sebelumnya agar bisa dibaca oleh agy"""
+    history = load_history()
+    if not history:
+        return ""
+    
+    lines = []
+    for msg in history:
+        sender = "Temanmu" if msg["role"] == "user" else "AIRI"
+        lines.append(f"{sender}: {msg['content']}")
+    
+    return "\n".join(lines)
+
+# ==================== UTILITY ====================
 
 def get_raspi_temp():
     try:
@@ -32,13 +94,23 @@ def get_raspi_temp():
             return "N/A"
 
 async def run_agy(prompt: str, attachment_paths: list = None) -> str:
-    """Menjalankan Antigravity CLI dengan persona teman dekat yang asik"""
+    """Menjalankan Antigravity CLI dengan persona teman dekat & memori konteks"""
     system_persona = (
         "[System Persona: Kamu adalah AIRI, asisten pribadi AI sekaligus teman dekat yang santai, ceria, dan asik. "
         "Gunakan gaya bahasa Indonesia kasual/santai sehari-hari seperti teman ngobrol (boleh pakai 'aku/kamu', 'nih', 'dong', 'yuk', emoji lucu secukupnya). "
         "JANGAN gunakan bahasa kaku/formal seperti robot korporat. "
         "Meskipun santai, tetap berikan jawaban yang cerdas, tepat, dan informatif saat menangani masalah server/coding.]\n\n"
     )
+
+    # Masukkan konteks memori/riwayat percakapan sebelumnya
+    history_context = ""
+    past_chat = format_history_for_prompt()
+    if past_chat:
+        history_context = (
+            f"[Ingatan & Riwayat Percakapan Sebelumnya:\n"
+            f"{past_chat}\n"
+            f"(Gunakan ingatan di atas untuk memahami konteks pembicaraan, tapi jawablah langsung pesan terbaru di bawah ini)]\n\n"
+        )
 
     attachment_notice = ""
     if attachment_paths:
@@ -53,7 +125,7 @@ async def run_agy(prompt: str, attachment_paths: list = None) -> str:
     if not user_text and attachment_paths:
         user_text = "(Temanmu mengirim gambar/lampiran tanpa pesan teks. Tolong buka dan periksa isinya ya!)"
 
-    full_prompt = f"{system_persona}{attachment_notice}Pesan dari temanmu: {user_text}"
+    full_prompt = f"{system_persona}{history_context}{attachment_notice}Pesan terbaru dari temanmu: {user_text}"
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -67,7 +139,15 @@ async def run_agy(prompt: str, attachment_paths: list = None) -> str:
         output = stdout.decode("utf-8").strip()
         if not output and stderr:
             output = stderr.decode("utf-8").strip()
-        return output if output else "Udah selesai aku kerjain nih, tapi nggak ada output teksnya~"
+            
+        final_response = output if output else "Udah selesai aku kerjain nih, tapi nggak ada output teksnya~"
+        
+        # Simpan interaksi ini ke memori permanen
+        if user_text:
+            add_to_history("user", user_text)
+            add_to_history("assistant", final_response)
+
+        return final_response
     except Exception as e:
         return f"Waduh ada error nih pas jalanin agy: {e}"
     finally:
@@ -110,6 +190,17 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="💾 Disk", value=f"{disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB ({disk.percent}%)", inline=False)
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="reset", description="Lupakan/reset riwayat ingatan percakapan AIRI")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def reset_memory(interaction: discord.Interaction):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Akses ditolak.", ephemeral=True)
+        return
+
+    clear_history()
+    await interaction.response.send_message("🧹 Memoriku sudah direset nih! Kita mulai obrolan baru dari nol ya~ ✨", ephemeral=True)
+
 @bot.tree.command(name="ask", description="Beri tugas atau tanya ke Antigravity Agent (agy)")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -122,7 +213,7 @@ async def ask(interaction: discord.Interaction, tugas: str, gambar: discord.Atta
         await interaction.response.send_message("❌ Akses ditolak.", ephemeral=True)
         return
 
-    await interaction.response.defer()  # Beri waktu agy memproses
+    await interaction.response.defer()
     
     saved_files = []
     if gambar:
@@ -134,7 +225,6 @@ async def ask(interaction: discord.Interaction, tugas: str, gambar: discord.Atta
 
     result = await run_agy(tugas, saved_files)
 
-    # Kirim respons ke Discord (potong jika lebih dari 2000 char)
     if len(result) <= 2000:
         await interaction.followup.send(result)
     else:
@@ -154,7 +244,6 @@ async def on_message(message: discord.Message):
         if OWNER_ID and message.author.id != OWNER_ID:
             return
 
-        # Cek jika tidak ada pesan dan tidak ada attachment
         if not message.content.strip() and not message.attachments:
             return
 
