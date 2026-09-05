@@ -1,6 +1,7 @@
 import os
 import subprocess
 import asyncio
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -11,6 +12,8 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+TEMP_DIR = "/tmp/airi_attachments"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -28,7 +31,7 @@ def get_raspi_temp():
         except Exception:
             return "N/A"
 
-async def run_agy(prompt: str) -> str:
+async def run_agy(prompt: str, attachment_paths: list = None) -> str:
     """Menjalankan Antigravity CLI dengan persona teman dekat yang asik"""
     system_persona = (
         "[System Persona: Kamu adalah AIRI, asisten pribadi AI sekaligus teman dekat yang santai, ceria, dan asik. "
@@ -36,8 +39,21 @@ async def run_agy(prompt: str) -> str:
         "JANGAN gunakan bahasa kaku/formal seperti robot korporat. "
         "Meskipun santai, tetap berikan jawaban yang cerdas, tepat, dan informatif saat menangani masalah server/coding.]\n\n"
     )
-    
-    full_prompt = f"{system_persona}Pesan dari temanmu: {prompt}"
+
+    attachment_notice = ""
+    if attachment_paths:
+        paths_str = "\n".join([f"- {path}" for path in attachment_paths])
+        attachment_notice = (
+            f"[Catatan Sistem: Temanmu melampirkan {len(attachment_paths)} file/gambar di server:\n"
+            f"{paths_str}\n"
+            f"Kamu BISA dan HARUS membuka/melihat file tersebut menggunakan tool 'view_file' untuk memeriksa isinya sebelum menjawab!]\n\n"
+        )
+
+    user_text = prompt.strip() if prompt else ""
+    if not user_text and attachment_paths:
+        user_text = "(Temanmu mengirim gambar/lampiran tanpa pesan teks. Tolong buka dan periksa isinya ya!)"
+
+    full_prompt = f"{system_persona}{attachment_notice}Pesan dari temanmu: {user_text}"
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -54,6 +70,14 @@ async def run_agy(prompt: str) -> str:
         return output if output else "Udah selesai aku kerjain nih, tapi nggak ada output teksnya~"
     except Exception as e:
         return f"Waduh ada error nih pas jalanin agy: {e}"
+    finally:
+        if attachment_paths:
+            for p in attachment_paths:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
 
 @bot.event
 async def on_ready():
@@ -89,14 +113,26 @@ async def status(interaction: discord.Interaction):
 @bot.tree.command(name="ask", description="Beri tugas atau tanya ke Antigravity Agent (agy)")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.describe(tugas="Perintah/tugas coding/analisis untuk agy")
-async def ask(interaction: discord.Interaction, tugas: str):
+@app_commands.describe(
+    tugas="Perintah/tugas coding/analisis untuk agy",
+    gambar="Lampiran gambar/file opsional untuk dianalisis"
+)
+async def ask(interaction: discord.Interaction, tugas: str, gambar: discord.Attachment = None):
     if OWNER_ID and interaction.user.id != OWNER_ID:
         await interaction.response.send_message("❌ Akses ditolak.", ephemeral=True)
         return
 
     await interaction.response.defer()  # Beri waktu agy memproses
-    result = await run_agy(tugas)
+    
+    saved_files = []
+    if gambar:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', gambar.filename)
+        file_path = os.path.join(TEMP_DIR, f"{interaction.id}_{safe_name}")
+        await gambar.save(file_path)
+        saved_files.append(file_path)
+
+    result = await run_agy(tugas, saved_files)
 
     # Kirim respons ke Discord (potong jika lebih dari 2000 char)
     if len(result) <= 2000:
@@ -113,13 +149,26 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
-    # Jika Anda DM langsung ke AIRI
-    if isinstance(message.channel, discord.DMChannel):
+    # Jika DM langsung ke AIRI
+    if isinstance(message.channel, (discord.DMChannel, discord.GroupChannel)):
         if OWNER_ID and message.author.id != OWNER_ID:
             return
 
+        # Cek jika tidak ada pesan dan tidak ada attachment
+        if not message.content.strip() and not message.attachments:
+            return
+
         async with message.channel.typing():
-            result = await run_agy(message.content)
+            saved_files = []
+            if message.attachments:
+                os.makedirs(TEMP_DIR, exist_ok=True)
+                for idx, att in enumerate(message.attachments):
+                    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', att.filename)
+                    file_path = os.path.join(TEMP_DIR, f"{message.id}_{idx}_{safe_name}")
+                    await att.save(file_path)
+                    saved_files.append(file_path)
+
+            result = await run_agy(message.content, saved_files)
             if len(result) <= 2000:
                 await message.channel.send(result)
             else:
