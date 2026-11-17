@@ -3,6 +3,7 @@ import subprocess
 import asyncio
 import re
 import json
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -15,8 +16,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 TEMP_DIR = "/tmp/airi_attachments"
-HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+HISTORY_FILE = os.path.join(BASE_DIR, "chat_history.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "bot_config.json")
 MAX_HISTORY_TURNS = 12  # Jumlah pesan terakhir yang disimpan sebagai ingatan
+MODEL_CACHE_TTL = 300   # Cache daftar model agy selama 5 menit
+
+_model_cache = {"timestamp": 0.0, "models": []}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -79,6 +85,89 @@ def format_history_for_prompt() -> str:
     
     return "\n".join(lines)
 
+# ==================== KONFIGURASI & MODEL AGY ====================
+
+def load_config() -> dict:
+    """Membaca konfigurasi bot (seperti model aktif) dari file JSON"""
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_config(config: dict):
+    """Menyimpan konfigurasi bot ke file JSON"""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error saving config: {e}")
+
+def get_active_model() -> str | None:
+    """Mengambil ID model yang sedang aktif (None berarti default agy)"""
+    return load_config().get("model")
+
+def set_active_model(model_id: str | None):
+    """Menyimpan ID model aktif secara permanen"""
+    config = load_config()
+    if model_id:
+        config["model"] = model_id
+    else:
+        config.pop("model", None)
+    save_config(config)
+
+async def get_available_models(force_refresh: bool = False) -> list[tuple[str, str]]:
+    """Mengambil daftar model langsung dari `agy models` secara dinamis."""
+    now = time.time()
+    if not force_refresh and _model_cache["models"] and (now - _model_cache["timestamp"] < MODEL_CACHE_TTL):
+        return _model_cache["models"]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            os.path.expanduser("~/.local/bin/agy"),
+            "models",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+        raw_text = stdout.decode("utf-8", errors="ignore")
+        # Bersihkan ANSI escape codes & carriage return dari spinner CLI
+        clean_text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw_text)
+
+        models = []
+        for segment in re.split(r"[\r\n]+", clean_text):
+            line = segment.strip()
+            if not line or "Fetching available models" in line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2 and re.match(r"^[a-z0-9][a-z0-9._-]+$", parts[0]):
+                models.append((parts[0], parts[1].strip()))
+
+        if models:
+            _model_cache["models"] = models
+            _model_cache["timestamp"] = now
+        return models
+    except Exception as e:
+        print(f"Error fetching agy models: {e}")
+        return _model_cache["models"]
+
+def resolve_model_query(query: str, models: list[tuple[str, str]]) -> tuple[tuple[str, str] | None, list[tuple[str, str]]]:
+    """Mencocokkan input user (exact ID atau potongan seperti 'hydrogen-medium') ke model agy."""
+    q = query.strip().lower()
+    for m_id, m_name in models:
+        if m_id.lower() == q:
+            return (m_id, m_name), []
+
+    matches = [
+        (m_id, m_name) for m_id, m_name in models
+        if q in m_id.lower() or q in m_name.lower()
+    ]
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
 # ==================== UTILITY ====================
 
 def get_raspi_temp():
@@ -128,10 +217,17 @@ async def run_agy(prompt: str, attachment_paths: list = None) -> str:
     full_prompt = f"{system_persona}{history_context}{attachment_notice}Pesan terbaru dari temanmu: {user_text}"
 
     try:
-        process = await asyncio.create_subprocess_exec(
+        cmd = [
             os.path.expanduser("~/.local/bin/agy"),
             "--prompt", full_prompt,
             "--dangerously-skip-permissions",
+        ]
+        active_model = get_active_model()
+        if active_model:
+            cmd.extend(["--model", active_model])
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -162,6 +258,8 @@ async def run_agy(prompt: str, attachment_paths: list = None) -> str:
 @bot.event
 async def on_ready():
     print(f"✨ AIRI (Powered by Antigravity CLI) sudah online sebagai: {bot.user}")
+    models = await get_available_models(force_refresh=True)
+    print(f"🧠 Terdeteksi {len(models)} model dari agy (aktif: {get_active_model() or 'default'}).")
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Berhasil sinkronisasi {len(synced)} perintah slash commands.")
@@ -200,6 +298,81 @@ async def reset_memory(interaction: discord.Interaction):
 
     clear_history()
     await interaction.response.send_message("🧹 Memoriku sudah direset nih! Kita mulai obrolan baru dari nol ya~ ✨", ephemeral=True)
+
+async def apply_model_selection(query: str | None, force_refresh: bool = False) -> str:
+    """Memproses pergantian atau pengecekan model agy secara adaptif."""
+    models = await get_available_models(force_refresh=force_refresh)
+    active = get_active_model()
+
+    if not query or query.strip().lower() == "list":
+        lines = [f"🤖 **Model aktif saat ini:** `{active or 'default (bawaan agy)'}`\n"]
+        if models:
+            lines.append("**Daftar model tersedia dari `agy`:**")
+            for m_id, m_name in models:
+                marker = " ✅" if m_id == active else ""
+                lines.append(f"• `{m_id}` — {m_name}{marker}")
+            lines.append("\nGunakan `/model <nama>` atau ketik `/model-hydrogen-medium` di DM, atau `/model default` untuk reset.")
+        else:
+            lines.append("⚠️ Gagal mengambil daftar model dari `agy models`.")
+        return "\n".join(lines)
+
+    if query.strip().lower() == "default":
+        set_active_model(None)
+        return "🔄 Model dikembalikan ke **default bawaan `agy`**!"
+
+    if not models:
+        return "⚠️ Daftar model `agy` lagi kosong atau gagal diambil nih."
+
+    matched, candidates = resolve_model_query(query, models)
+    if matched:
+        m_id, m_name = matched
+        set_active_model(m_id)
+        return f"✅ Siap! Model AIRI sekarang diganti ke **{m_name}** (`{m_id}`)."
+
+    if candidates:
+        opts = "\n".join([f"• `{m_id}` — {m_name}" for m_id, m_name in candidates[:10]])
+        return f"🤔 Ada beberapa model yang cocok dengan `{query}`:\n{opts}\nPilih yang lebih spesifik ya!"
+
+    return f"❌ Model `{query}` nggak ketemu di daftar `agy models`. Cek pakai `/model` dulu yuk!"
+
+@bot.tree.command(name="model", description="Lihat atau ganti model AI yang dipakai AIRI (adaptif sesuai agy)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(nama="Pilih model (kosongkan untuk lihat daftar, atau 'default' untuk reset)")
+async def model_cmd(interaction: discord.Interaction, nama: str = None):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Akses ditolak.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    # Refresh daftar model jika user mengecek list atau memilih model baru
+    reply = await apply_model_selection(nama, force_refresh=(nama is None))
+    if len(reply) <= 2000:
+        await interaction.followup.send(reply, ephemeral=True)
+    else:
+        for i in range(0, len(reply), 1900):
+            await interaction.followup.send(reply[i:i+1900], ephemeral=True)
+
+@model_cmd.autocomplete("nama")
+async def model_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        return []
+
+    models = await get_available_models()
+    q = current.strip().lower()
+    choices = []
+
+    if not q or "default".startswith(q):
+        choices.append(app_commands.Choice(name="default (Bawaan agy)", value="default"))
+
+    for m_id, m_name in models:
+        if not q or q in m_id.lower() or q in m_name.lower():
+            label = f"{m_name} ({m_id})"
+            choices.append(app_commands.Choice(name=label[:100], value=m_id[:100]))
+        if len(choices) >= 25:
+            break
+
+    return choices
 
 @bot.tree.command(name="ask", description="Beri tugas atau tanya ke Antigravity Agent (agy)")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -245,6 +418,16 @@ async def on_message(message: discord.Message):
             return
 
         if not message.content.strip() and not message.attachments:
+            return
+
+        # Shortcut teks DM seperti /model-hydrogen-medium atau /model
+        content_stripped = message.content.strip()
+        if not message.attachments and (content_stripped == "/model" or content_stripped.startswith("/model-")):
+            query = None if content_stripped == "/model" else content_stripped[len("/model-"):]
+            async with message.channel.typing():
+                reply = await apply_model_selection(query, force_refresh=(query is None))
+                for i in range(0, len(reply), 1900):
+                    await message.channel.send(reply[i:i+1900])
             return
 
         async with message.channel.typing():
