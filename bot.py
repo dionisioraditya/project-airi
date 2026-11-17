@@ -131,7 +131,14 @@ async def get_available_models(force_refresh: bool = False) -> list[tuple[str, s
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            print("Error fetching agy models: timeout (>45s)")
+            return _model_cache["models"]
+
         raw_text = stdout.decode("utf-8", errors="ignore")
         # Bersihkan ANSI escape codes & carriage return dari spinner CLI
         clean_text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw_text)
@@ -148,9 +155,11 @@ async def get_available_models(force_refresh: bool = False) -> list[tuple[str, s
         if models:
             _model_cache["models"] = models
             _model_cache["timestamp"] = now
+        elif stderr:
+            print(f"agy models stderr: {stderr.decode('utf-8', errors='ignore').strip()}")
         return models
     except Exception as e:
-        print(f"Error fetching agy models: {e}")
+        print(f"Error fetching agy models: {type(e).__name__}: {e}")
         return _model_cache["models"]
 
 def resolve_model_query(query: str, models: list[tuple[str, str]]) -> tuple[tuple[str, str] | None, list[tuple[str, str]]]:
